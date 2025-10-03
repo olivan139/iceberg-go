@@ -25,11 +25,13 @@ import (
 	"iter"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/metrics"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -310,7 +312,9 @@ func (scan *Scan) fetchPartitionSpecFilteredManifests(ctx context.Context) ([]ic
 		return nil, err
 	}
 	// Fetch all manifests for the current snapshot.
+	start := time.Now()
 	manifestList, err := snap.Manifests(afs)
+	metrics.RecordAvroFetch(ctx, "manifest_list", time.Since(start))
 	if err != nil {
 		return nil, err
 	}
@@ -353,6 +357,7 @@ func (scan *Scan) collectManifestEntries(
 	partitionEvaluators := newKeyDefaultMap(scan.buildPartitionEvaluator)
 
 	for _, mf := range manifestList {
+		mf := mf
 		if !scan.checkSequenceNumber(minSeqNum, mf) {
 			continue
 		}
@@ -363,7 +368,9 @@ func (scan *Scan) collectManifestEntries(
 				return err
 			}
 			partEval := partitionEvaluators.Get(int(mf.PartitionSpecID()))
+			start := time.Now()
 			manifestEntries, err := openManifest(fs, mf, partEval, metricsEval)
+			metrics.RecordAvroFetch(ctx, "manifest", time.Since(start))
 			if err != nil {
 				return err
 			}
@@ -490,14 +497,21 @@ func (scan *Scan) ToArrowTable(ctx context.Context) (arrow.Table, error) {
 	}
 
 	records := make([]arrow.Record, 0)
+	start := time.Now()
+	var resultBytes int64
 	for rec, err := range itr {
 		if err != nil {
+			metrics.RecordScanResult(ctx, time.Since(start), resultBytes)
 			return nil, err
 		}
 
+		resultBytes += recordSize(rec)
 		defer rec.Release()
 		records = append(records, rec)
 	}
 
-	return array.NewTableFromRecords(schema, records), nil
+	tbl := array.NewTableFromRecords(schema, records)
+	metrics.RecordScanResult(ctx, time.Since(start), resultBytes)
+
+	return tbl, nil
 }
