@@ -23,6 +23,7 @@ import (
 	"iter"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -31,6 +32,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/metrics"
 	"github.com/apache/iceberg-go/table/internal"
 	"github.com/apache/iceberg-go/table/substrait"
 	"github.com/substrait-io/substrait-go/v3/expr"
@@ -45,6 +47,19 @@ type (
 	positionDeletes   = []*arrow.Chunked
 	perFilePosDeletes = map[string]positionDeletes
 )
+
+func recordSize(rec arrow.Record) int64 {
+	if rec == nil {
+		return 0
+	}
+
+	var total int64
+	for i := 0; i < rec.NumCols(); i++ {
+		total += int64(rec.Column(i).Data().SizeInBytes())
+	}
+
+	return total
+}
 
 func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, concurrency int) (perFilePosDeletes, error) {
 	var (
@@ -326,7 +341,8 @@ func (as *arrowScan) processRecords(
 	fileSchema *iceberg.Schema,
 	rdr internal.FileReader,
 	columns []int,
-	pipeline []recProcessFn,
+	filters []recProcessFn,
+	projector recProcessFn,
 	out chan<- enumeratedRecord,
 ) (err error) {
 	var (
@@ -349,8 +365,10 @@ func (as *arrowScan) processRecords(
 	defer recRdr.Release()
 
 	var (
-		idx  int
-		prev arrow.Record
+		idx            int
+		prev           arrow.Record
+		filterDuration time.Duration
+		filteredBytes  int64
 	)
 
 	for recRdr.Next() {
@@ -364,12 +382,25 @@ func (as *arrowScan) processRecords(
 		prev = recRdr.Record()
 		prev.Retain()
 
-		for _, f := range pipeline {
-			prev, err = f(prev)
+		if len(filters) > 0 {
+			start := time.Now()
+			for _, f := range filters {
+				prev, err = f(prev)
+				if err != nil {
+					return err
+				}
+			}
+			filterDuration += time.Since(start)
+		}
+
+		if projector != nil {
+			prev, err = projector(prev)
 			if err != nil {
 				return err
 			}
 		}
+
+		filteredBytes += recordSize(prev)
 	}
 
 	if prev != nil {
@@ -380,6 +411,13 @@ func (as *arrowScan) processRecords(
 
 	if recRdr.Err() != nil && recRdr.Err() != io.EOF {
 		err = recRdr.Err()
+	}
+
+	if filterDuration > 0 {
+		metrics.RecordFilteringTime(ctx, filterDuration)
+	}
+	if filteredBytes > 0 {
+		metrics.AddFilteredVolume(ctx, filteredBytes)
 	}
 
 	return err
@@ -406,7 +444,7 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 	}
 	defer rdr.Close()
 
-	pipeline := make([]recProcessFn, 0, 2)
+	filters := make([]recProcessFn, 0, 2)
 	if len(positionalDeletes) > 0 {
 		deletes := set[int64]{}
 		for _, chunk := range positionalDeletes {
@@ -417,7 +455,7 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 			}
 		}
 
-		pipeline = append(pipeline, processPositionalDeletes(ctx, deletes))
+		filters = append(filters, processPositionalDeletes(ctx, deletes))
 	}
 
 	filterFunc, dropFile, err = as.getRecordFilter(ctx, iceSchema)
@@ -439,16 +477,16 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 	}
 
 	if filterFunc != nil {
-		pipeline = append(pipeline, filterFunc)
+		filters = append(filters, filterFunc)
 	}
 
-	pipeline = append(pipeline, func(r arrow.Record) (arrow.Record, error) {
+	projector := func(r arrow.Record) (arrow.Record, error) {
 		defer r.Release()
 
 		return ToRequestedSchema(ctx, as.projectedSchema, iceSchema, r, false, false, as.useLargeTypes)
-	})
+	}
 
-	err = as.processRecords(ctx, task, iceSchema, rdr, colIndices, pipeline, out)
+	err = as.processRecords(ctx, task, iceSchema, rdr, colIndices, filters, projector, out)
 
 	return
 }
