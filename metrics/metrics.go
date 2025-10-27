@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -24,6 +25,10 @@ var (
 	filteredDataVolume   metric.Int64Counter
 	scanResultDuration   metric.Float64Histogram
 	scanResultDataVolume metric.Int64Counter
+
+	genericInstrumentsMu sync.Mutex
+	genericHistograms    map[string]metric.Float64Histogram
+	genericCounters      map[string]metric.Int64Counter
 )
 
 func ensureMeter() {
@@ -111,6 +116,11 @@ func resetInstrumentsLocked() {
 	scanResultDuration = nil
 	scanResultDataVolume = nil
 	initOnce = sync.Once{}
+
+	genericInstrumentsMu.Lock()
+	genericHistograms = nil
+	genericCounters = nil
+	genericInstrumentsMu.Unlock()
 }
 
 func handle(err error) {
@@ -212,4 +222,96 @@ func RecordScanResult(ctx context.Context, d time.Duration, bytes int64) {
 	if scanResultDataVolume != nil && bytes > 0 {
 		scanResultDataVolume.Add(ctx, bytes)
 	}
+}
+
+var (
+	errEmptyInstrumentName  = errors.New("metrics: instrument name cannot be empty")
+	errNegativeCounterDelta = errors.New("metrics: counter delta must be non-negative")
+)
+
+// RecordHistogramValue records the provided value against a histogram identified
+// by name. Instruments are cached so repeated calls from C or Go callers do not
+// rebind every time a sample is emitted.
+func RecordHistogramValue(ctx context.Context, name string, value float64, attrs ...attribute.KeyValue) error {
+	if name == "" {
+		return errEmptyInstrumentName
+	}
+
+	hist, err := histogramByName(name)
+	if err != nil {
+		return err
+	}
+
+	if len(attrs) > 0 {
+		hist.Record(ctx, value, metric.WithAttributes(attrs...))
+	} else {
+		hist.Record(ctx, value)
+	}
+	return nil
+}
+
+// AddCounterValue adds the supplied delta to the named counter instrument. The
+// counter is initialised on first use and cached for subsequent calls.
+func AddCounterValue(ctx context.Context, name string, delta int64, attrs ...attribute.KeyValue) error {
+	if name == "" {
+		return errEmptyInstrumentName
+	}
+
+	if delta < 0 {
+		return errNegativeCounterDelta
+	}
+
+	counter, err := counterByName(name)
+	if err != nil {
+		return err
+	}
+
+	if len(attrs) > 0 {
+		counter.Add(ctx, delta, metric.WithAttributes(attrs...))
+	} else {
+		counter.Add(ctx, delta)
+	}
+	return nil
+}
+
+func histogramByName(name string) (metric.Float64Histogram, error) {
+	genericInstrumentsMu.Lock()
+	defer genericInstrumentsMu.Unlock()
+
+	if hist, ok := genericHistograms[name]; ok && hist != nil {
+		return hist, nil
+	}
+
+	m := otel.GetMeterProvider().Meter(meterName)
+	hist, err := m.Float64Histogram(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if genericHistograms == nil {
+		genericHistograms = make(map[string]metric.Float64Histogram)
+	}
+	genericHistograms[name] = hist
+	return hist, nil
+}
+
+func counterByName(name string) (metric.Int64Counter, error) {
+	genericInstrumentsMu.Lock()
+	defer genericInstrumentsMu.Unlock()
+
+	if counter, ok := genericCounters[name]; ok && counter != nil {
+		return counter, nil
+	}
+
+	m := otel.GetMeterProvider().Meter(meterName)
+	counter, err := m.Int64Counter(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if genericCounters == nil {
+		genericCounters = make(map[string]metric.Int64Counter)
+	}
+	genericCounters[name] = counter
+	return counter, nil
 }

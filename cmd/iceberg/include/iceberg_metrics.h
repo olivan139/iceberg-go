@@ -21,6 +21,8 @@ extern char *install_prometheus_metrics_provider(uintptr_t handle);
 extern char *shutdown_metrics_provider(void);
 extern void disable_metrics(void);
 extern void free_c_string(char *str);
+extern char *record_histogram_sample(const char *name, double value, const char *attrs);
+extern char *add_counter_sample(const char *name, long long delta, const char *attrs);
 
 /*
  * Convenience wrappers that provide a stable API for C/C++ callers.
@@ -37,6 +39,14 @@ static inline void iceberg_metrics_set_property(iceberg_metrics_property_map map
                                                 const char *key,
                                                 const char *value) {
         add_map_entry(map, key, value);
+}
+
+static inline char *iceberg_metrics_record_histogram(const char *name, double value, const char *attrs) {
+        return record_histogram_sample(name, value, attrs);
+}
+
+static inline char *iceberg_metrics_add_counter(const char *name, long long delta, const char *attrs) {
+        return add_counter_sample(name, delta, attrs);
 }
 
 /*
@@ -75,6 +85,13 @@ static inline void iceberg_metrics_free_error(char *err) {
  *      iceberg_metrics_delete_property_map(props);
  *      if (err != NULL) {
  *              fprintf(stderr, "failed to install metrics: %s\n", err);
+ *              iceberg_metrics_free_error(err);
+ *      }
+ *
+ *      double elapsed_ms = ...;
+ *      err = iceberg_metrics_record_histogram("iceberg.exec.duration", elapsed_ms, "stage=c");
+ *      if (err != NULL) {
+ *              fprintf(stderr, "failed to emit histogram: %s\n", err);
  *              iceberg_metrics_free_error(err);
  *      }
  */

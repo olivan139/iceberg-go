@@ -68,6 +68,28 @@ func add_map_entry(handle C.uintptr_t, key *C.char, value *C.char) {
 	props[goKey] = goValue
 }
 
+//export record_histogram_sample
+func record_histogram_sample(name *C.char, value C.double, attrs *C.char) *C.char {
+	metricName := goString(name)
+	attrList := metrics.ParseAttributeString(goString(attrs))
+
+	if err := metrics.RecordHistogramValue(context.Background(), metricName, float64(value), attrList...); err != nil {
+		return goError(err)
+	}
+	return nil
+}
+
+//export add_counter_sample
+func add_counter_sample(name *C.char, delta C.longlong, attrs *C.char) *C.char {
+	metricName := goString(name)
+	attrList := metrics.ParseAttributeString(goString(attrs))
+
+	if err := metrics.AddCounterValue(context.Background(), metricName, int64(delta), attrList...); err != nil {
+		return goError(err)
+	}
+	return nil
+}
+
 //export install_prometheus_metrics_provider
 func install_prometheus_metrics_provider(handle C.uintptr_t) *C.char {
 	props, err := propertiesFromHandle(handle)
@@ -204,6 +226,13 @@ func goError(err error) *C.char {
 		return nil
 	}
 	return C.CString(err.Error())
+}
+
+func goString(str *C.char) string {
+	if str == nil {
+		return ""
+	}
+	return C.GoString(str)
 }
 
 //export free_c_string
