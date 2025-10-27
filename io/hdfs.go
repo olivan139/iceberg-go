@@ -1,17 +1,24 @@
 package io
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	hdfs "github.com/colinmarc/hdfs/v2"
 	krb "github.com/jcmturner/gokrb5/v8/client"
 	krbconfig "github.com/jcmturner/gokrb5/v8/config"
 	krbkeytab "github.com/jcmturner/gokrb5/v8/keytab"
+
+	"github.com/apache/iceberg-go/metrics"
 )
 
 // Constants for HDFS configuration options
@@ -45,17 +52,33 @@ func (h *HdfsFS) preprocess(name string) string {
 // Open opens the named file for reading from HDFS.
 func (h *HdfsFS) Open(name string) (File, error) {
 	name = h.preprocess(name)
+	start := time.Now()
 	f, err := h.client.Open(name)
 	if err != nil {
+		metrics.RecordHDFSAccess(context.Background(), inferHDFSFormat(name), inferHDFSContent(name), time.Since(start))
 		return nil, err
 	}
-	return hdfsFile{f}, nil
+	hf := &hdfsFile{
+		FileReader: f,
+		name:       name,
+		format:     inferHDFSFormat(name),
+		content:    inferHDFSContent(name),
+	}
+	hf.ioNanos.Store(time.Since(start).Nanoseconds())
+	return hf, nil
 }
 
 // ReadFile reads the named file and returns its contents.
 func (h *HdfsFS) ReadFile(name string) ([]byte, error) {
 	name = h.preprocess(name)
-	return h.client.ReadFile(name)
+	start := time.Now()
+	data, err := h.client.ReadFile(name)
+	duration := time.Since(start)
+	metrics.RecordHDFSAccess(context.Background(), inferHDFSFormat(name), inferHDFSContent(name), duration)
+	if err == nil {
+		metrics.AddHDFSVolume(context.Background(), inferHDFSFormat(name), inferHDFSContent(name), int64(len(data)))
+	}
+	return data, err
 }
 
 // Remove removes the named file or (empty) directory from HDFS.
@@ -65,9 +88,84 @@ func (h *HdfsFS) Remove(name string) error {
 }
 
 // hdfsFile wraps a FileReader to implement fs.File, io.ReadSeekCloser, and io.ReaderAt.
-type hdfsFile struct{ *hdfs.FileReader }
+type hdfsFile struct {
+	*hdfs.FileReader
 
-func (f hdfsFile) Stat() (fs.FileInfo, error) { return f.FileReader.Stat(), nil }
+	name    string
+	format  string
+	content string
+
+	bytesRead atomic.Int64
+	ioNanos   atomic.Int64
+
+	closeOnce sync.Once
+}
+
+func (f *hdfsFile) Stat() (fs.FileInfo, error) { return f.FileReader.Stat(), nil }
+
+func (f *hdfsFile) Read(p []byte) (int, error) {
+	start := time.Now()
+	n, err := f.FileReader.Read(p)
+	f.ioNanos.Add(time.Since(start).Nanoseconds())
+	if n > 0 {
+		f.bytesRead.Add(int64(n))
+	}
+	return n, err
+}
+
+func (f *hdfsFile) ReadAt(p []byte, off int64) (int, error) {
+	start := time.Now()
+	n, err := f.FileReader.ReadAt(p, off)
+	f.ioNanos.Add(time.Since(start).Nanoseconds())
+	if n > 0 {
+		f.bytesRead.Add(int64(n))
+	}
+	return n, err
+}
+
+func (f *hdfsFile) Close() error {
+	var closeErr error
+	f.closeOnce.Do(func() {
+		start := time.Now()
+		closeErr = f.FileReader.Close()
+		f.ioNanos.Add(time.Since(start).Nanoseconds())
+		duration := time.Duration(f.ioNanos.Load())
+		metrics.RecordHDFSAccess(context.Background(), f.format, f.content, duration)
+		if read := f.bytesRead.Load(); read > 0 {
+			metrics.AddHDFSVolume(context.Background(), f.format, f.content, read)
+		}
+	})
+	return closeErr
+}
+
+func inferHDFSFormat(name string) string {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".parquet":
+		return "parquet"
+	case ".avro":
+		return "avro"
+	case ".orc":
+		return "orc"
+	default:
+		return ""
+	}
+}
+
+func inferHDFSContent(name string) string {
+	lower := strings.ToLower(name)
+	switch {
+	case strings.Contains(lower, "metadata"):
+		return "metadata"
+	case strings.Contains(lower, "manifest"):
+		return "manifest"
+	case strings.Contains(lower, "delete"):
+		return "deletes"
+	case strings.Contains(lower, "data"):
+		return "data"
+	default:
+		return ""
+	}
+}
 
 // createHDFSFS constructs an HDFS-backed IO from a parsed URL and configuration properties.
 func createHDFSFS(parsed *url.URL, props map[string]string) (IO, error) {

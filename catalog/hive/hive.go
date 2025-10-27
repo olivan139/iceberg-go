@@ -9,12 +9,14 @@ import (
 	"path"
 	"strconv"
 	"sync"
+	"time"
 	_ "unsafe"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	cataloginternal "github.com/apache/iceberg-go/catalog/internal"
 	"github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/metrics"
 	"github.com/apache/iceberg-go/table"
 	"github.com/beltran/gohive"
 	hms "github.com/beltran/gohive/hive_metastore"
@@ -327,11 +329,14 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 	tbl := identifier[1]
 
 	var hTable *hms.Table
-	if err := c.withRetry(func(cl metastoreClient) error {
+	start := time.Now()
+	err := c.withRetry(func(cl metastoreClient) error {
 		var err error
 		hTable, err = cl.GetTable(ctx, db, tbl)
 		return err
-	}); err != nil {
+	})
+	metrics.RecordHiveRequest(ctx, "get_table", time.Since(start))
+	if err != nil {
 		return nil, fmt.Errorf("load table %s.%s: %w", db, tbl, err)
 	}
 
