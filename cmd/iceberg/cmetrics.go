@@ -30,6 +30,9 @@ var (
 	activePrometheus *metrics.PrometheusProvider
 )
 
+// The C header `cmd/iceberg/include/iceberg_metrics.h` provides wrappers around
+// these exported functions so they can be consumed easily from the C runtime.
+
 //export new_property_map
 func new_property_map() C.uintptr_t {
 	props := make(ice.Properties)
