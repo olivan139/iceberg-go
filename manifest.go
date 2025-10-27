@@ -30,11 +30,13 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go/internal"
+	"github.com/apache/iceberg-go/internal/telemetry/metrics"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/google/uuid"
 
 	"github.com/hamba/avro/v2"
 	"github.com/hamba/avro/v2/ocf"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // ManifestContent indicates the type of data inside of the files
@@ -443,13 +445,24 @@ type hasFieldToIDMap interface {
 }
 
 func fetchManifestEntries(m ManifestFile, fs iceio.IO, discardDeleted bool) ([]ManifestEntry, error) {
+	start := time.Now()
+	attrs := []attribute.KeyValue{
+		attribute.String("manifest_path", m.FilePath()),
+		attribute.String("manifest_content", m.ManifestContent().String()),
+		attribute.Int("manifest_version", m.Version()),
+		attribute.Bool("discard_deleted", discardDeleted),
+	}
+
 	f, err := fs.Open(m.FilePath())
 	if err != nil {
+		metrics.RecordAvroMetadataFetch(time.Since(start), err, attrs...)
 		return nil, err
 	}
 	defer f.Close()
 
-	return ReadManifest(m, f, discardDeleted)
+	entries, err := ReadManifest(m, f, discardDeleted)
+	metrics.RecordAvroMetadataFetch(time.Since(start), err, attrs...)
+	return entries, err
 }
 
 // ManifestFile is the interface which covers both V1 and V2 manifest files.

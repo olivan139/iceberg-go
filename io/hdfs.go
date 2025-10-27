@@ -7,6 +7,10 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/apache/iceberg-go/internal/telemetry/metrics"
+	"go.opentelemetry.io/otel/attribute"
 
 	hdfs "github.com/colinmarc/hdfs/v2"
 	krb "github.com/jcmturner/gokrb5/v8/client"
@@ -45,7 +49,9 @@ func (h *HdfsFS) preprocess(name string) string {
 // Open opens the named file for reading from HDFS.
 func (h *HdfsFS) Open(name string) (File, error) {
 	name = h.preprocess(name)
+	start := time.Now()
 	f, err := h.client.Open(name)
+	metrics.RecordHDFSRequest("open", time.Since(start), err)
 	if err != nil {
 		return nil, err
 	}
@@ -55,13 +61,23 @@ func (h *HdfsFS) Open(name string) (File, error) {
 // ReadFile reads the named file and returns its contents.
 func (h *HdfsFS) ReadFile(name string) ([]byte, error) {
 	name = h.preprocess(name)
-	return h.client.ReadFile(name)
+	start := time.Now()
+	data, err := h.client.ReadFile(name)
+	metrics.RecordHDFSRequest("read_file", time.Since(start), err)
+	if err != nil {
+		return nil, err
+	}
+	metrics.AddHDFSBytes(int64(len(data)), attribute.String("operation", "read_file"))
+	return data, nil
 }
 
 // Remove removes the named file or (empty) directory from HDFS.
 func (h *HdfsFS) Remove(name string) error {
 	name = h.preprocess(name)
-	return h.client.Remove(name)
+	start := time.Now()
+	err := h.client.Remove(name)
+	metrics.RecordHDFSRequest("remove", time.Since(start), err)
+	return err
 }
 
 // hdfsFile wraps a FileReader to implement fs.File, io.ReadSeekCloser, and io.ReaderAt.
