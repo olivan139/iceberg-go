@@ -13,6 +13,7 @@ import (
 const meterName = "github.com/apache/iceberg-go"
 
 var (
+	meterMu  sync.Mutex
 	initOnce sync.Once
 
 	hiveRequestDuration  metric.Float64Histogram
@@ -26,6 +27,17 @@ var (
 )
 
 func ensureMeter() {
+	if hiveRequestDuration != nil {
+		return
+	}
+
+	meterMu.Lock()
+	defer meterMu.Unlock()
+
+	if hiveRequestDuration != nil {
+		return
+	}
+
 	initOnce.Do(func() {
 		m := otel.GetMeterProvider().Meter(meterName)
 
@@ -87,6 +99,18 @@ func ensureMeter() {
 		)
 		handle(err)
 	})
+}
+
+func resetInstrumentsLocked() {
+	hiveRequestDuration = nil
+	avroFetchDuration = nil
+	hdfsAccessDuration = nil
+	hdfsDataVolume = nil
+	filteringDuration = nil
+	filteredDataVolume = nil
+	scanResultDuration = nil
+	scanResultDataVolume = nil
+	initOnce = sync.Once{}
 }
 
 func handle(err error) {
