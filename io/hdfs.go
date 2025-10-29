@@ -55,7 +55,7 @@ func (h *HdfsFS) Open(name string) (File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return hdfsFile{f}, nil
+	return &hdfsFile{FileReader: f, path: name}, nil
 }
 
 // ReadFile reads the named file and returns its contents.
@@ -67,7 +67,7 @@ func (h *HdfsFS) ReadFile(name string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	metrics.AddHDFSBytes(int64(len(data)), attribute.String("operation", "read_file"))
+	recordHDFSBytes(name, "read_file", len(data))
 	return data, nil
 }
 
@@ -81,9 +81,55 @@ func (h *HdfsFS) Remove(name string) error {
 }
 
 // hdfsFile wraps a FileReader to implement fs.File, io.ReadSeekCloser, and io.ReaderAt.
-type hdfsFile struct{ *hdfs.FileReader }
+type hdfsFile struct {
+	*hdfs.FileReader
+	path string
+}
 
-func (f hdfsFile) Stat() (fs.FileInfo, error) { return f.FileReader.Stat(), nil }
+func (f *hdfsFile) Stat() (fs.FileInfo, error) { return f.FileReader.Stat(), nil }
+
+func (f *hdfsFile) Read(p []byte) (int, error) {
+	n, err := f.FileReader.Read(p)
+	recordHDFSBytes(f.path, "read", n)
+	return n, err
+}
+
+func (f *hdfsFile) ReadAt(p []byte, off int64) (int, error) {
+	n, err := f.FileReader.ReadAt(p, off)
+	recordHDFSBytes(f.path, "read_at", n)
+	return n, err
+}
+
+func recordHDFSBytes(path, operation string, n int) {
+	if n <= 0 {
+		return
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("operation", operation),
+	}
+
+	if kind := classifyHDFSPath(path); kind != "" {
+		attrs = append(attrs, attribute.String("file_kind", kind))
+	}
+
+	metrics.AddHDFSBytes(int64(n), attrs...)
+}
+
+func classifyHDFSPath(path string) string {
+	lower := strings.ToLower(path)
+	switch {
+	case strings.Contains(lower, "/metadata/"):
+		return "metadata"
+	case strings.HasSuffix(lower, ".avro"):
+		return "avro"
+	case strings.HasSuffix(lower, ".parquet"):
+		return "parquet"
+	case strings.HasSuffix(lower, ".orc"):
+		return "orc"
+	}
+	return ""
+}
 
 // createHDFSFS constructs an HDFS-backed IO from a parsed URL and configuration properties.
 func createHDFSFS(parsed *url.URL, props map[string]string) (IO, error) {
