@@ -3,6 +3,8 @@ package metrics
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,13 +17,16 @@ import (
 	"go.opentelemetry.io/otel/metric/instrument"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+
+	"github.com/google/uuid"
 )
 
 type Config struct {
 	Endpoint           string
 	ServiceName        string
 	ServiceVersion     string
+	InstanceID         string
 	Insecure           bool
 	CollectionInterval time.Duration
 }
@@ -76,10 +81,21 @@ func (c Config) withDefaults() Config {
 	if c.ServiceVersion == "" {
 		c.ServiceVersion = ""
 	}
+	if c.InstanceID == "" {
+		c.InstanceID = defaultInstanceID()
+	}
 	if c.Endpoint != "" && strings.HasPrefix(c.Endpoint, "http://") && !c.Insecure {
 		c.Insecure = true
 	}
 	return c
+}
+
+func defaultInstanceID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown-host"
+	}
+	return fmt.Sprintf("%s-%d-%s", host, os.Getpid(), uuid.NewString())
 }
 
 func Init(ctx context.Context, cfg Config) error {
@@ -97,12 +113,21 @@ func Init(ctx context.Context, cfg Config) error {
 			return
 		}
 
+		attrs := []attribute.KeyValue{
+			semconv.ServiceInstanceIDKey.String(cfg.InstanceID),
+		}
+		if cfg.ServiceName != "" {
+			attrs = append(attrs, semconv.ServiceNameKey.String(cfg.ServiceName))
+		}
+		if cfg.ServiceVersion != "" {
+			attrs = append(attrs, semconv.ServiceVersionKey.String(cfg.ServiceVersion))
+		}
+
 		res, err := sdkresource.Merge(
 			sdkresource.Default(),
 			sdkresource.NewWithAttributes(
 				semconv.SchemaURL,
-				semconv.ServiceName(cfg.ServiceName),
-				semconv.ServiceVersion(cfg.ServiceVersion),
+				attrs...,
 			),
 		)
 		if err != nil {
