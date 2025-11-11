@@ -3,6 +3,7 @@ package io
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
 	"strconv"
@@ -64,10 +65,55 @@ func (h *HdfsFS) Remove(name string) error {
 	return h.client.Remove(name)
 }
 
+// Create creates the named file in HDFS and returns a writer for it.
+func (h *HdfsFS) Create(name string) (FileWriter, error) {
+	name = h.preprocess(name)
+	w, err := h.client.Create(name)
+	if err != nil {
+		return nil, err
+	}
+
+	return &hdfsWriteFile{FileWriter: w}, nil
+}
+
+// WriteFile writes content to the named file in HDFS, replacing it if it exists.
+func (h *HdfsFS) WriteFile(name string, content []byte) error {
+	name = h.preprocess(name)
+
+	if err := h.client.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	writer, err := h.client.Create(name)
+	if err != nil {
+		return err
+	}
+
+	w := &hdfsWriteFile{FileWriter: writer}
+	if _, err := w.Write(content); err != nil {
+		_ = w.Close()
+		_ = h.client.Remove(name)
+		return err
+	}
+
+	if err := w.Close(); err != nil {
+		_ = h.client.Remove(name)
+		return err
+	}
+
+	return nil
+}
+
 // hdfsFile wraps a FileReader to implement fs.File, io.ReadSeekCloser, and io.ReaderAt.
 type hdfsFile struct{ *hdfs.FileReader }
 
 func (f hdfsFile) Stat() (fs.FileInfo, error) { return f.FileReader.Stat(), nil }
+
+type hdfsWriteFile struct{ *hdfs.FileWriter }
+
+func (f *hdfsWriteFile) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(f.FileWriter, r)
+}
 
 // createHDFSFS constructs an HDFS-backed IO from a parsed URL and configuration properties.
 func createHDFSFS(parsed *url.URL, props map[string]string) (IO, error) {
