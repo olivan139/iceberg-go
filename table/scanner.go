@@ -25,11 +25,14 @@ import (
 	"iter"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/internal/telemetry/metrics"
 	"github.com/apache/iceberg-go/io"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -132,23 +135,50 @@ func openManifest(io io.IO, manifest iceberg.ManifestFile,
 		return nil, err
 	}
 
+	filterStart := time.Now()
+	var filterErr error
+	var filteredBytes int64
+	filteredCount := 0
+	attrs := []attribute.KeyValue{
+		attribute.String("manifest_path", manifest.FilePath()),
+		attribute.String("manifest_content", manifest.ManifestContent().String()),
+		attribute.Int("manifest_entries", len(entries)),
+	}
+
 	out := make([]iceberg.ManifestEntry, 0, len(entries))
+	defer func() {
+		finalAttrs := append(attrs, attribute.Int("filtered_entries", filteredCount))
+		metrics.RecordFilteringDuration(time.Since(filterStart), filterErr, finalAttrs...)
+		if filterErr == nil && filteredBytes > 0 {
+			metrics.AddFilteredBytes(filteredBytes, finalAttrs...)
+		}
+	}()
+
 	for _, entry := range entries {
-		p, err := partitionFilter(entry.DataFile())
-		if err != nil {
-			return nil, err
+		var keep bool
+		keep, filterErr = partitionFilter(entry.DataFile())
+		if filterErr != nil {
+			return nil, filterErr
 		}
 
-		m, err := metricsEval(entry.DataFile())
-		if err != nil {
-			return nil, err
+		if !keep {
+			continue
 		}
 
-		if p && m {
+		var metricsOK bool
+		metricsOK, filterErr = metricsEval(entry.DataFile())
+		if filterErr != nil {
+			return nil, filterErr
+		}
+
+		if keep && metricsOK {
+			filteredBytes += entry.DataFile().FileSizeInBytes()
+			filteredCount++
 			out = append(out, entry)
 		}
 	}
 
+	filterErr = nil
 	return out, nil
 }
 

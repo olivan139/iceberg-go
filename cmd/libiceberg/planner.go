@@ -15,10 +15,13 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/cgo"
+	"time"
 	"unsafe"
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/apache/iceberg-go/internal/telemetry/metrics"
+	"go.opentelemetry.io/otel/attribute"
 	ice "stash.sigma.sbrf.ru/ryabina/sdp-iceberg-go"
 	"stash.sigma.sbrf.ru/ryabina/sdp-iceberg-go/pkg/json2boolexpr"
 	"stash.sigma.sbrf.ru/ryabina/sdp-iceberg-go/pkg/scanwire"
@@ -92,6 +95,17 @@ func prepare_scan_plan(
 	nsegs C.int32_t,
 	opts C.uintptr_t,
 ) (result C.prepare_scan_plan_result) {
+	start := time.Now()
+	attrs := []attribute.KeyValue{
+		attribute.Int("selected_fields", int(selected_fields_count)),
+		attribute.Bool("case_sensitive", bool(case_sensitive)),
+		attribute.Int64("row_limit", int64(row_limit)),
+		attribute.Int("segments", int(nsegs)),
+		attribute.Int64("requested_max_concurrency", int64(max_concurrency)),
+		attribute.Int("effective_max_concurrency", 1),
+		attribute.Bool("has_row_filter", len(row_filter) > 0),
+	}
+
 	// Обязательно перехватываем панику которая может возникнуть при извлечении значения из cgo.Handle
 	defer func() {
 		if r := recover(); r != nil {
@@ -100,22 +114,29 @@ func prepare_scan_plan(
 				message:    C.CString(fmt.Sprintf("invalid value: %v", r)),
 			}
 		}
+		var metricErr error
+		if result.error_code != 0 {
+			metricErr = fmt.Errorf("prepare_scan_plan failed with code %d", result.error_code)
+		}
+		metrics.RecordScanPlanTransfer(time.Since(start), metricErr, attrs...)
 	}()
 
 	currentOpts, ok := cgo.Handle(opts).Value().(ice.Properties)
 	if !ok {
-		return C.prepare_scan_plan_result{
+		result = C.prepare_scan_plan_result{
 			error_code: 1,
 			message:    C.CString("invalid arrow options"),
 		}
+		return result
 	}
 
 	tbl, ok := cgo.Handle(table_handle).Value().(*table.Table)
 	if !ok {
-		return C.prepare_scan_plan_result{
+		result = C.prepare_scan_plan_result{
 			error_code: 2,
 			message:    C.CString("invalid table handle"),
 		}
+		return result
 	}
 
 	slog.Debug(
@@ -126,10 +147,11 @@ func prepare_scan_plan(
 	)
 	filter, err := json2boolexpr.ParseJSON(row_filter)
 	if err != nil {
-		return C.prepare_scan_plan_result{
+		result = C.prepare_scan_plan_result{
 			error_code: 3,
 			message:    C.CString(err.Error()),
 		}
+		return result
 	}
 
 	s := tbl.Scan(
@@ -150,18 +172,25 @@ func prepare_scan_plan(
 		tbl.MetadataLocation(),
 	)
 	if err != nil {
-		return C.prepare_scan_plan_result{
+		result = C.prepare_scan_plan_result{
 			error_code: 4,
 			message:    C.CString(err.Error()),
 		}
+		return result
+	}
+
+	planTasks := 0
+	if plan := scan.GetPlan(); plan != nil {
+		planTasks = len(plan.GetTasks())
 	}
 
 	sscan, err := (proto.MarshalOptions{Deterministic: true, UseCachedSize: false}).Marshal(scan)
 	if err != nil || len(sscan) == 0 {
-		return C.prepare_scan_plan_result{
+		result = C.prepare_scan_plan_result{
 			error_code: 5,
 			message:    C.CString(err.Error()),
 		}
+		return result
 	}
 
 	// Кодироуем в base64 как строку
@@ -180,10 +209,18 @@ func prepare_scan_plan(
 		slog.Int("b64_len", len(sscan_string)),
 	)
 
-	return C.prepare_scan_plan_result{
+	planAttrs := append(attrs,
+		attribute.Int("plan_tasks", planTasks),
+		attribute.Int("serialized_bytes", len(sscan)),
+		attribute.String("encoding", "base64"),
+	)
+	metrics.RecordScanPlanSize(int64(len(sscan_string)), planAttrs...)
+
+	result = C.prepare_scan_plan_result{
 		error_code:      0,
 		serialized_scan: C.CString(sscan_string),
 	}
+	return result
 }
 
 // free_bytes освобождает память, выделенную в C, для байтового массива (*C.uchar).

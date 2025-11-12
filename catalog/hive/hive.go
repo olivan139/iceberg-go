@@ -9,11 +9,13 @@ import (
 	"path"
 	"strconv"
 	"sync"
+	"time"
 	_ "unsafe"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	cataloginternal "github.com/apache/iceberg-go/catalog/internal"
+	"github.com/apache/iceberg-go/internal/telemetry/metrics"
 	"github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/beltran/gohive"
@@ -69,7 +71,9 @@ func (g gohiveClient) DropDatabase(ctx context.Context, name string, deleteData,
 }
 
 var connectToMetastore = func(host string, port int, auth string, cfg *gohive.MetastoreConnectConfiguration) (metastoreClient, error) {
+	start := time.Now()
 	client, err := gohive.ConnectToMetastore(host, port, auth, cfg)
+	metrics.RecordHiveRequest("connect", time.Since(start), err)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +188,7 @@ func (c *Catalog) reconnect() error {
 
 // withRetry executes fn using the current metastore client. If fn returns an
 // error, the catalog will attempt to reconnect and invoke fn again once.
-func (c *Catalog) withRetry(fn func(metastoreClient) error) error {
+func (c *Catalog) withRetry(op string, fn func(metastoreClient) error) error {
 	c.mu.Lock()
 	client := c.client
 	c.mu.Unlock()
@@ -198,7 +202,7 @@ func (c *Catalog) withRetry(fn func(metastoreClient) error) error {
 		c.mu.Unlock()
 	}
 
-	if err := fn(client); err != nil {
+	if err := c.invokeWithMetrics(op, client, fn); err != nil {
 		if rerr := c.reconnect(); rerr != nil {
 			return err
 		}
@@ -206,10 +210,17 @@ func (c *Catalog) withRetry(fn func(metastoreClient) error) error {
 		c.mu.Lock()
 		client = c.client
 		c.mu.Unlock()
-		return fn(client)
+		return c.invokeWithMetrics(op, client, fn)
 	}
 
 	return nil
+}
+
+func (c *Catalog) invokeWithMetrics(op string, client metastoreClient, fn func(metastoreClient) error) error {
+	start := time.Now()
+	err := fn(client)
+	metrics.RecordHiveRequest(op, time.Since(start), err)
+	return err
 }
 
 var _ catalog.Catalog = (*Catalog)(nil)
@@ -274,7 +285,7 @@ func (c *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, 
 	// Create the table using the metastore client. The withRetry helper
 	// ensures that the operation is retried once if the connection was
 	// dropped and then re-established.
-	if err := c.withRetry(func(cl metastoreClient) error {
+	if err := c.withRetry("create_table", func(cl metastoreClient) error {
 		return cl.CreateTable(ctx, input)
 	}); err != nil {
 		return nil, fmt.Errorf("create table %s.%s: %w", database, tableName, err)
@@ -301,7 +312,7 @@ func (c *Catalog) ListTables(ctx context.Context, namespace table.Identifier) it
 		db := namespace[0]
 
 		var tables []string
-		if err := c.withRetry(func(cl metastoreClient) error {
+		if err := c.withRetry("list_tables", func(cl metastoreClient) error {
 			var err error
 			tables, err = cl.GetAllTables(ctx, db)
 			return err
@@ -327,7 +338,7 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 	tbl := identifier[1]
 
 	var hTable *hms.Table
-	if err := c.withRetry(func(cl metastoreClient) error {
+	if err := c.withRetry("load_table", func(cl metastoreClient) error {
 		var err error
 		hTable, err = cl.GetTable(ctx, db, tbl)
 		return err
@@ -364,7 +375,7 @@ func (c *Catalog) DropTable(ctx context.Context, identifier table.Identifier) er
 	db := identifier[0]
 	tbl := identifier[1]
 
-	return c.withRetry(func(cl metastoreClient) error {
+	return c.withRetry("drop_table", func(cl metastoreClient) error {
 		return cl.DropTable(ctx, db, tbl, true)
 	})
 }
@@ -376,7 +387,7 @@ func (c *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (*
 	}
 
 	var tblObj *hms.Table
-	if err := c.withRetry(func(cl metastoreClient) error {
+	if err := c.withRetry("rename_table", func(cl metastoreClient) error {
 		var err error
 		tblObj, err = cl.GetTable(ctx, from[0], from[1])
 		if err != nil {
@@ -404,7 +415,7 @@ func (c *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) (
 	}
 
 	var dbs []string
-	if err := c.withRetry(func(cl metastoreClient) error {
+	if err := c.withRetry("list_namespaces", func(cl metastoreClient) error {
 		var err error
 		dbs, err = cl.GetAllDatabases(ctx)
 		return err
@@ -437,7 +448,7 @@ func (c *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifie
 		}
 	}
 
-	return c.withRetry(func(cl metastoreClient) error {
+	return c.withRetry("create_namespace", func(cl metastoreClient) error {
 		return cl.CreateDatabase(ctx, db)
 	})
 }
@@ -449,7 +460,7 @@ func (c *Catalog) DropNamespace(ctx context.Context, namespace table.Identifier)
 	}
 	db := namespace[0]
 
-	return c.withRetry(func(cl metastoreClient) error {
+	return c.withRetry("drop_namespace", func(cl metastoreClient) error {
 		// deleteData=true ensures underlying data is deleted, cascade=true
 		// removes all tables contained in the namespace.
 		return cl.DropDatabase(ctx, db, true, true)
@@ -465,7 +476,7 @@ func (c *Catalog) CheckNamespaceExists(ctx context.Context, namespace table.Iden
 	dbName := namespace[0]
 
 	var dbObj *hms.Database
-	err := c.withRetry(func(cl metastoreClient) error {
+	err := c.withRetry("check_namespace_exists", func(cl metastoreClient) error {
 		var err error
 		dbObj, err = cl.GetDatabase(ctx, dbName)
 		return err
@@ -494,7 +505,7 @@ func (c *Catalog) LoadNamespaceProperties(ctx context.Context, namespace table.I
 	dbName := namespace[0]
 
 	var dbObj *hms.Database
-	if err := c.withRetry(func(cl metastoreClient) error {
+	if err := c.withRetry("load_namespace", func(cl metastoreClient) error {
 		var err error
 		dbObj, err = cl.GetDatabase(ctx, dbName)
 		return err
@@ -535,7 +546,7 @@ func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table
 
 	dbName := namespace[0]
 
-	err := c.withRetry(func(cl metastoreClient) error {
+	err := c.withRetry("update_namespace", func(cl metastoreClient) error {
 		dbObj, err := cl.GetDatabase(ctx, dbName)
 		if err != nil {
 			var noSuch *hms.NoSuchObjectException
