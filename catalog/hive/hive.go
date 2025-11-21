@@ -298,7 +298,65 @@ func (c *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, 
 
 // CommitTable commits table metadata to the catalog.
 func (c *Catalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
-	panic("not implemented")
+	ident := tbl.Identifier()
+	if len(ident) != 2 {
+		return nil, "", fmt.Errorf("invalid identifier: %v", ident)
+	}
+
+	current, err := c.LoadTable(ctx, ident, nil)
+	if err != nil && !errors.Is(err, catalog.ErrNoSuchTable) {
+		return nil, "", err
+	}
+	if current == nil {
+		return nil, "", catalog.ErrNoSuchTable
+	}
+
+	staged, err := cataloginternal.UpdateAndStageTable(ctx, current, ident, reqs, updates, c)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if staged.Metadata().Equals(current.Metadata()) {
+		return current.Metadata(), current.MetadataLocation(), nil
+	}
+
+	if err := cataloginternal.WriteMetadata(ctx, staged.Metadata(), staged.MetadataLocation(), staged.Properties()); err != nil {
+		return nil, "", err
+	}
+
+	database, tableName := ident[0], ident[1]
+	err = c.withRetry("commit_table", func(cl metastoreClient) error {
+		hTable, err := cl.GetTable(ctx, database, tableName)
+		if err != nil {
+			return err
+		}
+		if hTable == nil {
+			return catalog.ErrNoSuchTable
+		}
+
+		if hTable.Parameters == nil {
+			hTable.Parameters = map[string]string{}
+		}
+
+		if currLoc := hTable.Parameters["metadata_location"]; currLoc != "" && currLoc != current.MetadataLocation() {
+			return fmt.Errorf("table has been updated by another process: expected %s, found %s", current.MetadataLocation(), currLoc)
+		}
+
+		hTable.Parameters["metadata_location"] = staged.MetadataLocation()
+		hTable.Parameters["previous_metadata_location"] = current.MetadataLocation()
+
+		if hTable.Sd == nil {
+			hTable.Sd = &hms.StorageDescriptor{}
+		}
+		hTable.Sd.Location = path.Dir(staged.MetadataLocation())
+
+		return cl.AlterTable(ctx, database, tableName, hTable)
+	})
+	if err != nil {
+		return nil, "", err
+	}
+
+	return staged.Metadata(), staged.MetadataLocation(), nil
 }
 
 // ListTables returns identifiers of tables in the provided namespace.
@@ -405,7 +463,33 @@ func (c *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (*
 
 // CheckTableExists checks whether a table exists.
 func (c *Catalog) CheckTableExists(ctx context.Context, identifier table.Identifier) (bool, error) {
-	panic("not implemented")
+	if len(identifier) != 2 {
+		return false, fmt.Errorf("invalid identifier: %v", identifier)
+	}
+
+	db := identifier[0]
+	tbl := identifier[1]
+
+	var hTable *hms.Table
+	err := c.withRetry("check_table_exists", func(cl metastoreClient) error {
+		var err error
+		hTable, err = cl.GetTable(ctx, db, tbl)
+		return err
+	})
+	if err != nil {
+		var noSuch *hms.NoSuchObjectException
+		if errors.As(err, &noSuch) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if hTable == nil {
+		return false, nil
+	}
+
+	_, ok := hTable.Parameters["metadata_location"]
+	return ok, nil
 }
 
 // ListNamespaces lists available namespaces, optionally filtering by parent.
