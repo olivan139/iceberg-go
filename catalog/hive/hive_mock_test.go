@@ -10,6 +10,7 @@ import (
 	"iter"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -255,6 +256,45 @@ func TestHiveCatalogLoadTableInvalid(t *testing.T) {
 	if _, err := cat.LoadTable(context.Background(), table.Identifier{"db"}, nil); err == nil {
 		t.Fatalf("expected error")
 	}
+}
+
+func TestHiveCatalogCommitTable(t *testing.T) {
+	mt := newMockMetastore()
+	sc := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true})
+	dir := t.TempDir()
+	loc := writeMetadata(t, dir, sc)
+	mt.tables["db.tbl"] = &hms.Table{DbName: "db", TableName: "tbl", Parameters: map[string]string{"metadata_location": loc}, Sd: &hms.StorageDescriptor{Location: dir}}
+	cat := &Catalog{client: mt}
+
+	tbl, err := cat.LoadTable(context.Background(), table.Identifier{"db", "tbl"}, nil)
+	require.NoError(t, err)
+
+	updates := []table.Update{table.NewSetPropertiesUpdate(iceberg.Properties{"foo": "bar"})}
+	meta, newLoc, err := cat.CommitTable(context.Background(), tbl, nil, updates)
+	require.NoError(t, err)
+
+	require.NotEqual(t, loc, newLoc)
+	require.Equal(t, newLoc, mt.tables["db.tbl"].Parameters["metadata_location"])
+	require.Equal(t, loc, mt.tables["db.tbl"].Parameters["previous_metadata_location"])
+	require.Equal(t, path.Dir(newLoc), mt.tables["db.tbl"].Sd.Location)
+	require.Equal(t, "bar", meta.Properties().Get("foo", ""))
+}
+
+func TestHiveCatalogCheckTableExists(t *testing.T) {
+	mt := newMockMetastore()
+	sc := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true})
+	dir := t.TempDir()
+	loc := writeMetadata(t, dir, sc)
+	mt.tables["db.tbl"] = &hms.Table{DbName: "db", TableName: "tbl", Parameters: map[string]string{"metadata_location": loc}, Sd: &hms.StorageDescriptor{Location: dir}}
+	cat := &Catalog{client: mt}
+
+	exists, err := cat.CheckTableExists(context.Background(), table.Identifier{"db", "tbl"})
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	exists, err = cat.CheckTableExists(context.Background(), table.Identifier{"db", "missing"})
+	require.NoError(t, err)
+	require.False(t, exists)
 }
 
 func TestHiveCatalogDropTable(t *testing.T) {
