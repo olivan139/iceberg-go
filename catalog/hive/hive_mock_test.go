@@ -78,8 +78,12 @@ func (m *mockMetastore) DropTable(ctx context.Context, db, tbl string, _ bool) e
 }
 
 func (m *mockMetastore) AlterTable(ctx context.Context, db, tbl string, newTable *hms.Table) error {
-	m.tables[newTable.DbName+"."+newTable.TableName] = newTable
-	delete(m.tables, db+"."+tbl)
+	oldKey := db + "." + tbl
+	newKey := newTable.DbName + "." + newTable.TableName
+	if oldKey != newKey {
+		delete(m.tables, oldKey)
+	}
+	m.tables[newKey] = newTable
 	return nil
 }
 
